@@ -6,26 +6,35 @@
 //  - Mitspieler (Clients) simulieren NICHT selbst. Ihre Maus-Aktionen
 //    (Element, Pinselgröße, Linie von/bis ...) werden an den Host geschickt,
 //    der sie mit den originalen Sandboxels-Funktionen ausführt.
-//  - Der Host schickt ~20x pro Sekunde nur die geänderten Pixel (binär) an alle.
+//    Damit es sich nicht verzögert anfühlt, zeigt der Client seine Striche
+//    sofort als Vorschau an; der Host korrigiert sie danach falls nötig.
+//  - Der Host schickt nach jedem Tick nur die geänderten Pixel (binär,
+//    komprimiert) an alle.
 //  - Verbindung per WebRTC über PeerJS (öffentlicher Vermittlungsserver,
 //    kein eigener Server nötig). Raumcode = Peer-ID des Hosts.
 
 (function () {
 	"use strict";
 
-	const MP_VERSION = 1;
+	const MP_VERSION = 2;
 	const PEERJS_URLS = [
 		"https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js",
 		"https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js",
 	];
 	const ID_PREFIX = "sbmp-";
-	const SYNC_MS = 50;            // Host -> Clients Pixel-Updates (20/s)
+	const SYNC_MIN_MS = 28;        // max. ~30 Pixel-Updates pro Sekunde
+	const SYNC_IDLE_MS = 50;       // Updates, wenn pausiert
 	const CURSOR_MS = 66;          // Cursor-Updates (~15/s)
-	const TEMP_STEP = 3;           // Temperaturänderung ab der neu gesendet wird
+	const TEMP_STEP = 10;          // Temperaturänderung ab der neu gesendet wird
 	const MAX_REMOTE_SIZE = 150;   // max. Pinselgröße für Mitspieler
-	const MAX_BUFFERED = 4 * 1024 * 1024; // Backpressure-Grenze pro Verbindung
-	const REC = 13;                // Bytes pro Pixel-Datensatz
+	const BACKLOG_BYTES = 1024 * 1024; // ab hier werden Updates gesammelt statt gesendet
+	const CHUNK = 60000;           // max. Größe einer einzelnen WebRTC-Nachricht
+	const PREDICT_MS = 200;        // + Ping: danach Vorschau-Pixel beim Host nachfragen
 	const PLAYER_COLORS = ["#ff4d4d", "#4da6ff", "#5cff5c", "#ffd24d", "#ff66ff", "#4dffff", "#ff9933", "#b366ff"];
+
+	// Binär-Nachrichten: [u8 Typ][u8 Flags][u32 pixelTicks][Daten]
+	const MSG_DIFF = 1, MSG_FULL = 2, MSG_CHUNK = 9;
+	const FLAG_DEFLATE = 1;
 
 	const mp = window.sbMultiplayer = {
 		role: null,       // null | "host" | "client"
@@ -34,6 +43,7 @@
 		code: null,
 		myId: null,
 		players: {},      // id -> {id,name,color,x,y,s,e}
+		stats: { sent: 0, recv: 0, syncs: 0, syncMs: 0, ping: 0 },
 	};
 
 	// ---------------------------------------------------------------- helpers
@@ -112,6 +122,56 @@
 		return f;
 	}
 
+	// ---------------------------------------------------- binary / compression
+
+	const canDeflate = typeof CompressionStream === "function" && typeof DecompressionStream === "function";
+
+	async function streamBytes(u8, stream) {
+		const out = new Blob([u8]).stream().pipeThrough(stream);
+		return new Uint8Array(await new Response(out).arrayBuffer());
+	}
+
+	// Baut eine Binär-Nachricht (komprimiert, wenn es sich lohnt)
+	async function packMessage(type, ticks, payload) {
+		let flags = 0;
+		if (canDeflate && payload.length > 256) {
+			try {
+				const z = await streamBytes(payload, new CompressionStream("deflate-raw"));
+				if (z.length < payload.length) { payload = z; flags |= FLAG_DEFLATE; }
+			} catch (e) { }
+		}
+		const out = new Uint8Array(6 + payload.length);
+		out[0] = type; out[1] = flags;
+		new DataView(out.buffer).setUint32(2, ticks >>> 0, true);
+		out.set(payload, 6);
+		return out.buffer;
+	}
+
+	// Zellen-Liste (aufsteigend sortierte Indizes) aus den prev-Arrays kodieren.
+	// Layout: u32 Anzahl | Index-Deltas (varint) | Element u16[] | R[] | G[] | B[] | Flags[] | Alpha[] | Temp i16[]
+	function encodeCells(list, count) {
+		const pE = host.prevE, pC = host.prevC, pF = host.prevF, pA = host.prevA, pT = host.prevT;
+		const buf = new Uint8Array(4 + count * 15);
+		new DataView(buf.buffer).setUint32(0, count, true);
+		let o = 4, prev = 0;
+		for (let k = 0; k < count; k++) {
+			let d = list[k] - prev;
+			prev = list[k];
+			while (d >= 128) { buf[o++] = (d & 127) | 128; d >>>= 7; }
+			buf[o++] = d;
+		}
+		const eo = o, ro = eo + 2 * count, go = ro + count, bo = go + count, fo = bo + count, ao = fo + count, to = ao + count;
+		for (let k = 0; k < count; k++) {
+			const i = list[k];
+			const e = pE[i], c = pC[i], t = pT[i];
+			buf[eo + 2 * k] = e & 255; buf[eo + 2 * k + 1] = e >> 8;
+			buf[ro + k] = (c >> 16) & 255; buf[go + k] = (c >> 8) & 255; buf[bo + k] = c & 255;
+			buf[fo + k] = pF[i]; buf[ao + k] = pA[i];
+			buf[to + 2 * k] = t & 255; buf[to + 2 * k + 1] = (t >> 8) & 255;
+		}
+		return buf.subarray(0, to + 2 * count);
+	}
+
 	// ------------------------------------------------------------ hooks setup
 
 	let hooksInstalled = false;
@@ -148,6 +208,7 @@
 				p: currentProp,
 				pv: currentPropValue,
 			});
+			predict(mouseType, startPos.x, startPos.y, mouseX, mouseY);
 		};
 
 		// Clients simulieren nicht selbst – die Welt kommt komplett vom Host.
@@ -192,23 +253,81 @@
 			return orig.resizeCanvas.apply(this, arguments);
 		};
 
+		// Host: direkt nach jedem Simulations-Tick synchronisieren
+		runEveryTick(() => {
+			if (mp.role === "host" && performance.now() - host.lastSync >= SYNC_MIN_MS) hostSync();
+		});
 		renderPostPixel(drawRemoteCursors);
+		setInterval(updateNetStats, 1000);
 	}
 
 	// ------------------------------------------------------------------- host
 
 	const host = {
-		conns: {},        // peerId -> {conn, player, needsFull, lastPlace}
+		conns: {},        // peerId -> {id, conn, player, needsFull, lastPlace, backlog:Set|null}
 		elemIds: {},      // name -> id (1..)
 		elemNames: [null],
-		prevE: null, prevC: null, prevF: null, prevA: null, prevT: null,
+		prevE: null, prevC: null, prevF: null, prevA: null, prevT: null, prevCS: null,
+		changed: null,
 		W: 0, H: 0,
-		buf: null, view: null,
 		syncTimer: null,
+		lastSync: 0,
+		lastCursor: 0,
 		lastPaused: null,
 		lastBorder: null,
-		cursorTick: 0,
+		queue: Promise.resolve(),
+		chunkId: 0,
 	};
+
+	// Alle Sendungen laufen nacheinander durch diese Warteschlange,
+	// damit die Reihenfolge trotz asynchroner Kompression erhalten bleibt.
+	function enqueue(fn) {
+		host.queue = host.queue.then(fn).catch(err => console.error("[MP]", err));
+	}
+
+	function sendRaw(conn, data) {
+		if (!conn.open) return;
+		try {
+			conn.send(data);
+			mp.stats.sent += typeof data === "string" ? data.length : data.byteLength;
+		} catch (e) { console.error("[MP] Senden fehlgeschlagen", e); }
+	}
+
+	function sendJSON(conn, obj) { sendRaw(conn, JSON.stringify(obj)); }
+
+	// Große Nachrichten in Stücke teilen (WebRTC-Limit)
+	function sendBinary(conn, buf) {
+		if (buf.byteLength <= CHUNK) return sendRaw(conn, buf);
+		const id = ++host.chunkId >>> 0;
+		const total = Math.ceil(buf.byteLength / CHUNK);
+		const src = new Uint8Array(buf);
+		for (let i = 0; i < total; i++) {
+			const part = src.subarray(i * CHUNK, Math.min(src.length, (i + 1) * CHUNK));
+			const out = new Uint8Array(10 + part.length);
+			const dv = new DataView(out.buffer);
+			out[0] = MSG_CHUNK;
+			dv.setUint32(2, id, true);
+			dv.setUint16(6, i, true);
+			dv.setUint16(8, total, true);
+			out.set(part, 10);
+			sendRaw(conn, out.buffer);
+		}
+	}
+
+	function buffered(c) {
+		const dc = c.conn.dataChannel;
+		return dc ? dc.bufferedAmount : 0;
+	}
+
+	function broadcast(msg) {
+		const s = JSON.stringify(msg);
+		const targets = Object.values(host.conns);
+		enqueue(() => { for (const c of targets) sendRaw(c.conn, s); });
+	}
+
+	function broadcastPlayers() {
+		broadcast({ t: "players", l: Object.values(mp.players).map(p => ({ id: p.id, name: p.name, color: p.color })) });
+	}
 
 	function elemId(name) {
 		let id = host.elemIds[name];
@@ -239,7 +358,9 @@
 					mp.players = {};
 					mp.players[peer.id] = { id: peer.id, name: mp.name, color: PLAYER_COLORS[0], x: 0, y: 0, s: 1, e: "" };
 					resetHostBuffers();
-					host.syncTimer = setInterval(hostSync, SYNC_MS);
+					host.syncTimer = setInterval(() => {
+						if (performance.now() - host.lastSync >= SYNC_IDLE_MS) hostSync();
+					}, SYNC_IDLE_MS / 2);
 					setBusy(false);
 					log("Raum erstellt! Code: " + code);
 					updatePanel();
@@ -258,8 +379,18 @@
 	}
 
 	function onHostConnection(conn) {
-		conn.on("open", () => { });
-		conn.on("data", (msg) => {
+		conn.on("data", (data) => {
+			if (typeof data !== "string") {
+				// Alte Mod-Version (andere Serialisierung)
+				if (data && data.t === "hello") {
+					try { conn.send({ t: "err", m: "Andere Mod-Version - bitte Mod aktualisieren!" }); } catch (e) { }
+					setTimeout(() => conn.close(), 500);
+				}
+				return;
+			}
+			mp.stats.recv += data.length;
+			let msg;
+			try { msg = JSON.parse(data); } catch (e) { return; }
 			try { handleHostMessage(conn, msg); }
 			catch (err) { console.error("[MP] Fehler bei Nachricht", msg, err); }
 		});
@@ -282,16 +413,16 @@
 		const c = host.conns[conn.peer];
 		if (msg.t === "hello") {
 			if (msg.v !== MP_VERSION) {
-				conn.send({ t: "err", m: "Andere Mod-Version (Host: " + MP_VERSION + ")" });
+				sendJSON(conn, { t: "err", m: "Andere Mod-Version (Host: " + MP_VERSION + ") - bitte Mod aktualisieren!" });
 				setTimeout(() => conn.close(), 500);
 				return;
 			}
 			const used = Object.values(mp.players).map(p => p.color);
 			const color = PLAYER_COLORS.find(col => used.indexOf(col) === -1) || PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)];
 			const player = { id: conn.peer, name: String(msg.name || "Spieler").slice(0, 20), color: color, x: -100, y: -100, s: 1, e: "" };
-			host.conns[conn.peer] = { conn: conn, player: player, needsFull: true, lastPlace: -100 };
+			host.conns[conn.peer] = { id: conn.peer, conn: conn, player: player, needsFull: true, lastPlace: -100, backlog: null };
 			mp.players[conn.peer] = player;
-			conn.send({
+			sendJSON(conn, {
 				t: "welcome",
 				id: conn.peer,
 				w: width, h: height,
@@ -317,7 +448,28 @@
 				paused = !!msg.v; manualPaused = paused; checkPause();
 				break;
 			case "full": c.needsFull = true; break;
+			case "ping": {
+				const ts = msg.ts;
+				enqueue(() => sendJSON(conn, { t: "pong", ts: ts }));
+				break;
+			}
+			case "cells": sendCells(c, msg.l); break;
 		}
+	}
+
+	// Client fragt den echten Zustand einzelner Zellen nach (Vorschau prüfen)
+	function sendCells(c, list) {
+		if (!Array.isArray(list) || !host.prevE) return;
+		const n = host.prevE.length;
+		const idx = Int32Array.from(new Set(list.filter(i => Number.isInteger(i) && i >= 0 && i < n))).sort();
+		if (!idx.length) return;
+		if (c.backlog || c.needsFull) {
+			if (c.backlog) for (const i of idx) c.backlog.add(i);
+			return;
+		}
+		const payload = encodeCells(idx, idx.length).slice();
+		const ticks = pixelTicks;
+		enqueue(async () => sendBinary(c.conn, await packMessage(MSG_DIFF, ticks, payload)));
 	}
 
 	function applyRemoteAction(c, a) {
@@ -371,24 +523,15 @@
 		host.prevF = new Uint8Array(n);
 		host.prevA = new Uint8Array(n);
 		host.prevT = new Int16Array(n);
-		host.buf = new ArrayBuffer(n * REC);
-		host.view = new DataView(host.buf);
-		for (const id in host.conns) host.conns[id].needsFull = true;
-	}
-
-	function writeRec(v, o, idx, e, c, f, a, t) {
-		v.setUint32(o, idx, true);
-		v.setUint16(o + 4, e, true);
-		v.setUint8(o + 6, (c >> 16) & 255);
-		v.setUint8(o + 7, (c >> 8) & 255);
-		v.setUint8(o + 8, c & 255);
-		v.setUint8(o + 9, f);
-		v.setUint8(o + 10, a);
-		v.setInt16(o + 11, t, true);
+		host.prevCS = new Array(n);
+		host.changed = new Int32Array(n);
+		for (const id in host.conns) { host.conns[id].needsFull = true; host.conns[id].backlog = null; }
 	}
 
 	function hostSync() {
 		if (mp.role !== "host") return;
+		const t0 = performance.now();
+		host.lastSync = t0;
 		if (width + 1 !== host.W || height + 1 !== host.H) {
 			resetHostBuffers();
 			broadcast({ t: "size", w: width, h: height });
@@ -404,36 +547,36 @@
 			broadcast({ t: "border", border: currentSaveData.border, save: { voidX: currentSaveData.voidX, voidY: currentSaveData.voidY, loopX: currentSaveData.loopX, loopY: currentSaveData.loopY } });
 		}
 
-		const connIds = Object.keys(host.conns);
+		// Welt scannen und Änderungen gegenüber dem zuletzt gesendeten Stand sammeln
 		const W = host.W, H = host.H;
-		const pE = host.prevE, pC = host.prevC, pF = host.prevF, pA = host.prevA, pT = host.prevT;
-		const v = host.view;
-		let o = 0;
-		let total = 0;
-		for (let x = 0; x < W; x++) {
-			const col = pixelMap[x];
-			for (let y = 0; y < H; y++) {
-				const i = y * W + x;
+		const pE = host.prevE, pC = host.prevC, pF = host.prevF, pA = host.prevA, pT = host.prevT, pCS = host.prevCS;
+		const changed = host.changed;
+		let count = 0;
+		for (let y = 0; y < H; y++) {
+			const row = y * W;
+			for (let x = 0; x < W; x++) {
+				const i = row + x;
+				const col = pixelMap[x];
 				let p = col ? col[y] : undefined;
 				if (!p || p.del) {
 					if (pE[i] !== 0) {
-						pE[i] = 0;
-						writeRec(v, o, i, 0, 0, 0, 0, 0); o += REC;
+						pE[i] = 0; pC[i] = 0; pF[i] = 0; pA[i] = 0; pT[i] = 0; pCS[i] = undefined;
+						changed[count++] = i;
 					}
 					continue;
 				}
-				total++;
 				if (p.con && elements[p.element] && elements[p.element].canContain === true && elements[p.con.element]) p = p.con;
 				const e = elemId(p.element);
-				const c = colorToInt(p.color);
+				const cs = p.color;
+				const c = cs === pCS[i] ? pC[i] : colorToInt(cs);
 				const f = pixelFlags(p);
 				const a = p.alpha === undefined ? 255 : Math.max(0, Math.min(254, Math.round(p.alpha * 254)));
 				let t = Math.round(p.temp);
 				if (!(t === t)) t = 20;
 				if (t > 32767) t = 32767; else if (t < -32768) t = -32768;
 				if (e !== pE[i] || c !== pC[i] || f !== pF[i] || a !== pA[i] || Math.abs(t - pT[i]) >= TEMP_STEP) {
-					pE[i] = e; pC[i] = c; pF[i] = f; pA[i] = a; pT[i] = t;
-					writeRec(v, o, i, e, c, f, a, t); o += REC;
+					pE[i] = e; pC[i] = c; pF[i] = f; pA[i] = a; pT[i] = t; pCS[i] = cs;
+					changed[count++] = i;
 				}
 			}
 		}
@@ -442,52 +585,63 @@
 		const me = mp.players[mp.myId];
 		if (me) { me.x = mousePos.x; me.y = mousePos.y; me.s = mouseSize; me.e = currentElement; }
 
-		if (!connIds.length) return;
-		const diff = o > 0 ? host.buf.slice(0, o) : null;
-		let full = null;
-		for (const id of connIds) {
-			const c = host.conns[id];
-			const dc = c.conn.dataChannel;
-			if (!c.conn.open) continue;
-			if (dc && dc.bufferedAmount > MAX_BUFFERED) { c.needsFull = true; continue; }
-			if (c.needsFull) {
-				if (!full) full = buildFull(total);
-				c.conn.send({ t: "d", f: 1, k: pixelTicks, b: full });
-				c.needsFull = false;
+		const conns = Object.values(host.conns);
+		if (conns.length) {
+			const ticks = pixelTicks;
+			const changedList = count ? changed.slice(0, count) : null;
+			const diff = count ? encodeCells(changedList, count).slice() : null;
+			let full = null;
+			const jobs = [];
+			for (const c of conns) {
+				if (c.needsFull) {
+					if (!full) full = buildFull();
+					c.needsFull = false;
+					c.backlog = null;
+					jobs.push([c, full, MSG_FULL]);
+				}
+				else if (c.backlog) {
+					if (changedList) for (let k = 0; k < count; k++) c.backlog.add(changedList[k]);
+				}
+				else if (diff) {
+					jobs.push([c, diff, MSG_DIFF]);
+				}
 			}
-			else if (diff) {
-				c.conn.send({ t: "d", f: 0, k: pixelTicks, b: diff });
+			enqueue(async () => {
+				const packed = new Map();
+				for (const [c, payload, type] of jobs) {
+					if (host.conns[c.id] !== c) continue;
+					// Verbindung kommt nicht hinterher -> Änderungen sammeln und später gebündelt senden
+					if (type === MSG_DIFF && buffered(c) > BACKLOG_BYTES) {
+						c.backlog = new Set(changedList);
+						continue;
+					}
+					let msg = packed.get(payload);
+					if (!msg) { msg = await packMessage(type, ticks, payload); packed.set(payload, msg); }
+					sendBinary(c.conn, msg);
+				}
+				for (const c of conns) {
+					if (!c.backlog || host.conns[c.id] !== c || buffered(c) > BACKLOG_BYTES / 4) continue;
+					const list = Int32Array.from(c.backlog).sort();
+					c.backlog = null;
+					if (list.length) sendBinary(c.conn, await packMessage(MSG_DIFF, pixelTicks, encodeCells(list, list.length).slice()));
+				}
+			});
+			if (t0 - host.lastCursor >= 100) {
+				host.lastCursor = t0;
+				broadcast({ t: "cur", l: Object.values(mp.players).map(p => [p.id, p.x, p.y, p.s, p.e]) });
 			}
 		}
-		host.cursorTick += SYNC_MS;
-		if (host.cursorTick >= 100) {
-			host.cursorTick = 0;
-			broadcast({ t: "cur", l: Object.values(mp.players).map(p => [p.id, p.x, p.y, p.s, p.e]) });
-		}
+		mp.stats.syncs++;
+		mp.stats.syncMs += performance.now() - t0;
 	}
 
 	// Kompletter Zustand aus den prev-Arrays (die gerade aktualisiert wurden)
-	function buildFull(count) {
-		const buf = new ArrayBuffer(count * REC);
-		const v = new DataView(buf);
-		const pE = host.prevE, pC = host.prevC, pF = host.prevF, pA = host.prevA, pT = host.prevT;
-		let o = 0;
-		for (let i = 0; i < pE.length && o < buf.byteLength; i++) {
-			if (pE[i] === 0) continue;
-			writeRec(v, o, i, pE[i], pC[i], pF[i], pA[i], pT[i]); o += REC;
-		}
-		return o === buf.byteLength ? buf : buf.slice(0, o);
-	}
-
-	function broadcast(msg) {
-		for (const id in host.conns) {
-			const c = host.conns[id];
-			if (c.conn.open) c.conn.send(msg);
-		}
-	}
-
-	function broadcastPlayers() {
-		broadcast({ t: "players", l: Object.values(mp.players).map(p => ({ id: p.id, name: p.name, color: p.color })) });
+	function buildFull() {
+		const pE = host.prevE;
+		const list = new Int32Array(pE.length);
+		let n = 0;
+		for (let i = 0; i < pE.length; i++) if (pE[i] !== 0) list[n++] = i;
+		return encodeCells(list, n).slice();
 	}
 
 	// ----------------------------------------------------------------- client
@@ -501,6 +655,10 @@
 		save: null,
 		timer: null,
 		lastCursor: "",
+		lastPing: 0,
+		queue: Promise.resolve(),
+		chunks: {},
+		pred: new Map(),   // Zellindex -> Zeitpunkt der Vorschau
 	};
 
 	function joinRoom(code) {
@@ -512,18 +670,19 @@
 			const peer = new Peer();
 			mp.peer = peer;
 			peer.on("open", () => {
-				const conn = peer.connect(ID_PREFIX + code, { reliable: true });
+				const conn = peer.connect(ID_PREFIX + code, { reliable: true, serialization: "raw" });
 				client.conn = conn;
 				const timeout = setTimeout(() => {
-					if (mp.role !== "client") { log("Keine Antwort vom Host."); leave(); }
+					if (mp.role !== "client") { log("Keine Antwort vom Host (gleiche Mod-Version?)."); leave(); }
 				}, 15000);
 				conn.on("open", () => {
-					conn.send({ t: "hello", name: mp.name, v: MP_VERSION });
+					conn.send(JSON.stringify({ t: "hello", name: mp.name, v: MP_VERSION }));
 				});
-				conn.on("data", (msg) => {
-					if (msg && msg.t === "welcome") clearTimeout(timeout);
-					try { handleClientMessage(msg); }
-					catch (err) { console.error("[MP] Fehler bei Nachricht", msg, err); }
+				conn.on("data", (data) => {
+					if (typeof data === "string" && data.indexOf('"welcome"') !== -1) clearTimeout(timeout);
+					client.queue = client.queue
+						.then(() => handleClientData(data))
+						.catch(err => console.error("[MP] Fehler bei Nachricht", err));
 				});
 				conn.on("close", () => { if (mp.role === "client") { log("Verbindung zum Host getrennt."); leave(); } });
 				conn.on("error", (err) => { console.error(err); });
@@ -538,7 +697,49 @@
 	}
 
 	function sendToHost(msg) {
-		if (mp.role === "client" && client.conn && client.conn.open) client.conn.send(msg);
+		if (mp.role === "client" && client.conn && client.conn.open) {
+			const s = JSON.stringify(msg);
+			client.conn.send(s);
+			mp.stats.sent += s.length;
+		}
+	}
+
+	async function handleClientData(data) {
+		if (typeof data === "string") {
+			mp.stats.recv += data.length;
+			handleClientMessage(JSON.parse(data));
+			return;
+		}
+		let u8;
+		if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+		else if (data && data.buffer instanceof ArrayBuffer) u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+		else if (data instanceof Blob) u8 = new Uint8Array(await data.arrayBuffer());
+		else return;
+		mp.stats.recv += u8.length;
+		if (u8[0] === MSG_CHUNK) {
+			const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+			const id = dv.getUint32(2, true), idx = dv.getUint16(6, true), total = dv.getUint16(8, true);
+			const ch = client.chunks[id] || (client.chunks[id] = { parts: [], got: 0 });
+			if (!ch.parts[idx]) { ch.parts[idx] = u8.slice(10); ch.got++; }
+			if (ch.got < total) return;
+			delete client.chunks[id];
+			let len = 0;
+			for (const p of ch.parts) len += p.length;
+			u8 = new Uint8Array(len);
+			let o = 0;
+			for (const p of ch.parts) { u8.set(p, o); o += p.length; }
+		}
+		if (mp.role !== "client") return;
+		const type = u8[0], flags = u8[1];
+		const ticks = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint32(2, true);
+		let payload = u8.subarray(6);
+		if (flags & FLAG_DEFLATE) payload = await streamBytes(payload, new DecompressionStream("deflate-raw"));
+		if (mp.role !== "client") return;
+		if (type === MSG_DIFF || type === MSG_FULL) {
+			applyCells(payload, type === MSG_FULL);
+			pixelTicks = ticks;
+			lastPixelDraw = -1; // neu zeichnen
+		}
 	}
 
 	function applyHostSize() {
@@ -549,6 +750,7 @@
 		}
 		finally { internal--; }
 		currentPixels = [];
+		client.pred.clear();
 	}
 
 	function applyBorder(border, save) {
@@ -592,6 +794,9 @@
 			case "paused":
 				setHostPaused(msg.v);
 				break;
+			case "pong":
+				mp.stats.ping = Math.round(performance.now() - msg.ts);
+				break;
 			case "players": {
 				const old = mp.players;
 				mp.players = {};
@@ -603,15 +808,11 @@
 			}
 			case "cur":
 				for (const [id, x, y, s, e] of msg.l) {
+					if (id === mp.myId) continue;
 					const p = mp.players[id];
 					if (p) { p.x = x; p.y = y; p.s = s; p.e = e; }
 				}
 				lastPixelDraw = -1;
-				break;
-			case "d":
-				applyDiff(msg.b, msg.f === 1);
-				if (typeof msg.k === "number") pixelTicks = msg.k;
-				lastPixelDraw = -1; // neu zeichnen
 				break;
 		}
 	}
@@ -623,26 +824,35 @@
 		try { checkPause(); } catch (e) { }
 	}
 
-	function applyDiff(buffer, isFull) {
-		if (!buffer) return;
-		if (buffer.buffer) buffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+	function applyCells(u8, isFull) {
 		const W = client.W;
+		const pred = client.pred;
 		if (isFull) {
 			currentPixels = [];
 			for (let x = 0; x < pixelMap.length; x++) {
 				const col = pixelMap[x];
 				if (col) for (let y = 0; y < col.length; y++) col[y] = undefined;
 			}
+			pred.clear();
 		}
-		const v = new DataView(buffer);
-		const n = Math.floor(buffer.byteLength / REC);
-		for (let k = 0; k < n; k++) {
-			const o = k * REC;
-			const idx = v.getUint32(o, true);
-			const x = idx % W, y = (idx - x) / W;
+		const count = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint32(0, true);
+		let o = 4, idx = 0;
+		const idxs = new Int32Array(count);
+		for (let k = 0; k < count; k++) {
+			let v = 0, shift = 0, b;
+			do { b = u8[o++]; v += (b & 127) * Math.pow(2, shift); shift += 7; } while (b & 128);
+			idx += v;
+			idxs[k] = idx;
+		}
+		const eo = o, ro = eo + 2 * count, go = ro + count, bo = go + count, fo = bo + count, ao = fo + count, to = ao + count;
+		const checkPred = pred.size > 0;
+		for (let k = 0; k < count; k++) {
+			const i = idxs[k];
+			const x = i % W, y = (i - x) / W;
 			const col = pixelMap[x];
 			if (!col) continue;
-			const e = v.getUint16(o + 4, true);
+			if (checkPred) pred.delete(i);
+			const e = u8[eo + 2 * k] | (u8[eo + 2 * k + 1] << 8);
 			let p = col[y];
 			if (e === 0) {
 				if (p) { p.del = true; col[y] = undefined; }
@@ -656,8 +866,8 @@
 			const name = client.elemNames[e];
 			if (name && elements[name]) { p.element = name; delete p.invalidElement; }
 			else { p.element = "unknown"; p.invalidElement = name || "???"; }
-			p.color = intToColor((v.getUint8(o + 6) << 16) | (v.getUint8(o + 7) << 8) | v.getUint8(o + 8));
-			const f = v.getUint8(o + 9);
+			p.color = intToColor((u8[ro + k] << 16) | (u8[go + k] << 8) | u8[bo + k]);
+			const f = u8[fo + k];
 			if (f & 1) p.charge = 1; else delete p.charge;
 			if (f & 2) p.burning = true; else delete p.burning;
 			if (f & 4) p.glow = true; else if (f & 8) p.glow = false; else delete p.glow;
@@ -665,27 +875,89 @@
 			if (f & 32) p.flipY = true; else delete p.flipY;
 			const r = (f >> 6) & 3;
 			if (r) p.r = r; else delete p.r;
-			const a = v.getUint8(o + 10);
+			const a = u8[ao + k];
 			if (a === 255) delete p.alpha; else p.alpha = a / 254;
-			p.temp = v.getInt16(o + 11, true);
+			let t = u8[to + 2 * k] | (u8[to + 2 * k + 1] << 8);
+			if (t & 0x8000) t -= 0x10000;
+			p.temp = t;
 		}
+	}
+
+	// Sofort-Vorschau: eigene Striche direkt anzeigen, ohne auf den Host zu warten
+	function predict(type, sx, sy, x, y) {
+		if (type === "left") {
+			const info = elements[currentElement];
+			if (!info || currentElement === "unknown" || currentElement === "mix") return;
+			if (info.tool && !info.canPlace) return; // Werkzeuge nur beim Host
+		}
+		else if (type !== "right") return;
+		let coords;
+		try { coords = lineCoords(sx, sy, x, y); } catch (e) { return; }
+		const now = performance.now();
+		const W = client.W;
+		let any = false;
+		for (const [cx, cy] of coords) {
+			if (outOfBounds(cx, cy)) continue;
+			const col = pixelMap[cx];
+			if (!col) continue;
+			const p = col[cy];
+			if (type === "left") {
+				if (p && mode !== "replace") continue;
+				if (p) p.del = true;
+				const np = { x: cx, y: cy, start: 0, element: currentElement, temp: 20 };
+				np.color = predictColor(np);
+				col[cy] = np;
+				currentPixels.push(np);
+			}
+			else {
+				if (!p) continue;
+				p.del = true;
+				col[cy] = undefined;
+			}
+			client.pred.set(cy * W + cx, now);
+			any = true;
+		}
+		if (any) lastPixelDraw = -1;
+	}
+
+	function predictColor(p) {
+		try {
+			const info = elements[p.element];
+			if ((info.customColor || info.singleColor) && currentColorMap[p.element]) return pixelColorPick(p, currentColorMap[p.element]);
+			return pixelColorPick(p);
+		} catch (e) { return "rgb(255,255,255)"; }
 	}
 
 	function clientLoop() {
 		if (mp.role !== "client") return;
+		const now = performance.now();
 		// Cursor senden
 		const key = mousePos.x + "," + mousePos.y + "," + mouseSize + "," + currentElement;
 		if (key !== client.lastCursor) {
 			client.lastCursor = key;
 			sendToHost({ t: "c", x: mousePos.x, y: mousePos.y, s: mouseSize, e: currentElement });
-			const me = mp.players[mp.myId];
-			if (me) { me.x = mousePos.x; me.y = mousePos.y; me.s = mouseSize; }
 		}
 		// Pause-Button wurde lokal gedrückt -> an Host weiterleiten
 		// (manualPaused = Absicht des Spielers; "paused" ändern auch Menüs/Prompts)
 		if (!!manualPaused !== client.hostPaused) {
 			client.hostPaused = !!manualPaused;
 			sendToHost({ t: "pause", v: client.hostPaused });
+		}
+		// Vorschau-Pixel, die der Host nicht bestätigt hat, nachfragen
+		if (client.pred.size) {
+			const limit = now - PREDICT_MS - mp.stats.ping;
+			const ask = [];
+			for (const [i, t] of client.pred) {
+				if (t > limit) continue;
+				ask.push(i);
+				client.pred.delete(i);
+				if (ask.length >= 20000) break;
+			}
+			if (ask.length) sendToHost({ t: "cells", l: ask });
+		}
+		if (now - client.lastPing > 2000) {
+			client.lastPing = now;
+			sendToHost({ t: "ping", ts: now });
 		}
 	}
 
@@ -725,8 +997,11 @@
 		host.conns = {};
 		if (client.conn) { try { client.conn.close(); } catch (e) { } client.conn = null; }
 		if (mp.peer) { try { mp.peer.destroy(); } catch (e) { } mp.peer = null; }
+		client.pred.clear();
+		client.chunks = {};
 		mp.players = {};
 		mp.code = null;
+		mp.stats.ping = 0;
 		if (wasClient && hooksInstalled) materializeMirror();
 		setBusy(false);
 		if (role) log("Multiplayer beendet.");
@@ -774,6 +1049,21 @@
 
 	function esc(s) { return String(s).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])); }
 
+	// Netzwerk-Anzeige (1x pro Sekunde)
+	let lastStats = { sent: 0, recv: 0, syncs: 0, syncMs: 0 };
+	function updateNetStats() {
+		const s = mp.stats;
+		const up = (s.sent - lastStats.sent) / 1024, down = (s.recv - lastStats.recv) / 1024;
+		const syncs = s.syncs - lastStats.syncs;
+		const syncMs = syncs ? (s.syncMs - lastStats.syncMs) / syncs : 0;
+		lastStats = { sent: s.sent, recv: s.recv, syncs: s.syncs, syncMs: s.syncMs };
+		const el = panel && panel.querySelector("#sbmpNet");
+		if (!el) return;
+		if (mp.role === "host") el.textContent = "Upload " + up.toFixed(0) + " KB/s · " + syncs + " Updates/s · Scan " + syncMs.toFixed(1) + " ms";
+		else if (mp.role === "client") el.textContent = "Ping " + s.ping + " ms · Download " + down.toFixed(0) + " KB/s";
+		else el.textContent = "";
+	}
+
 	function buildPanel() {
 		const style = document.createElement("style");
 		style.textContent = `
@@ -790,6 +1080,7 @@
 #sbmpPanel li{padding:1px 0}
 #sbmpPanel .dot{display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%}
 #sbmpPanel .status{color:#aaa;font-size:11px;margin-top:5px;word-wrap:break-word}
+#sbmpPanel .net{color:#8fd18f;font-size:11px;margin-top:3px}
 #sbmpPanel .x{width:auto;margin:0;padding:0 6px;background:none;border:none;font-size:16px}
 `;
 		document.head.appendChild(style);
@@ -838,6 +1129,7 @@
 			}
 			html += `</ul><button data-act="leave">${mp.role === "host" ? "Raum schließen" : "Verlassen"}</button>`;
 		}
+		html += `<div class="net" id="sbmpNet"></div>`;
 		html += `<div class="status" id="sbmpStatus">${statusEl ? esc(statusEl.textContent) : ""}</div>`;
 		panel.innerHTML = html;
 		statusEl = panel.querySelector("#sbmpStatus");
