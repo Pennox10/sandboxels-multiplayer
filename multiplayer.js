@@ -14,7 +14,10 @@
 	"use strict";
 
 	const MP_VERSION = 1;
-	const PEERJS_URL = "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js";
+	const PEERJS_URLS = [
+		"https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js",
+		"https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js",
+	];
 	const ID_PREFIX = "sbmp-";
 	const SYNC_MS = 50;            // Host -> Clients Pixel-Updates (20/s)
 	const CURSOR_MS = 66;          // Cursor-Updates (~15/s)
@@ -43,11 +46,15 @@
 	function loadPeerJS() {
 		return new Promise((resolve, reject) => {
 			if (window.Peer) return resolve();
-			const s = document.createElement("script");
-			s.src = PEERJS_URL;
-			s.onload = () => resolve();
-			s.onerror = () => reject(new Error("PeerJS konnte nicht geladen werden"));
-			document.head.appendChild(s);
+			const tryUrl = (i) => {
+				if (i >= PEERJS_URLS.length) return reject(new Error("PeerJS konnte nicht geladen werden (Internet/Firewall?)"));
+				const s = document.createElement("script");
+				s.src = PEERJS_URLS[i];
+				s.onload = () => window.Peer ? resolve() : tryUrl(i + 1);
+				s.onerror = () => tryUrl(i + 1);
+				document.head.appendChild(s);
+			};
+			tryUrl(0);
 		});
 	}
 
@@ -770,7 +777,9 @@
 	function buildPanel() {
 		const style = document.createElement("style");
 		style.textContent = `
-#sbmpPanel{position:fixed;top:10px;right:10px;z-index:9999;width:230px;background:rgba(20,20,20,.94);color:#fff;border:2px solid #555;font:13px Arial,sans-serif;padding:8px 10px;box-shadow:0 2px 10px rgba(0,0,0,.5);display:none}
+#multiplayerButton{position:fixed;top:10px;right:10px;z-index:10000;padding:6px 12px;background:#2a2a2a;color:#fff;border:2px solid #4da6ff;font:bold 14px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.5)}
+#multiplayerButton:hover{background:#3a3a3a}
+#sbmpPanel{position:fixed;top:48px;right:10px;z-index:9999;width:230px;background:rgba(20,20,20,.94);color:#fff;border:2px solid #555;font:13px Arial,sans-serif;padding:8px 10px;box-shadow:0 2px 10px rgba(0,0,0,.5);display:none}
 #sbmpPanel h3{margin:0 0 6px;font-size:15px;display:flex;justify-content:space-between;align-items:center}
 #sbmpPanel input{width:100%;box-sizing:border-box;margin:3px 0;padding:4px;background:#333;color:#fff;border:1px solid #666;font-size:13px}
 #sbmpPanel button{width:100%;margin:3px 0;padding:5px;background:#444;color:#fff;border:1px solid #777;cursor:pointer;font-size:13px}
@@ -794,13 +803,12 @@
 
 		const btn = document.createElement("button");
 		btn.id = "multiplayerButton";
-		btn.className = "controlButton";
 		btn.title = "Multiplayer";
 		btn.textContent = "Multiplayer";
 		btn.onclick = () => { togglePanel(); };
-		const tc = document.getElementById("toolControls");
-		if (tc) tc.appendChild(btn);
-		else { btn.style.cssText = "position:fixed;bottom:10px;right:10px;z-index:9999"; document.body.appendChild(btn); }
+		// Schwebend oben rechts, damit der Button immer sichtbar ist
+		// (die Werkzeugleiste ist scrollbar und schneidet Buttons ab)
+		document.body.appendChild(btn);
 		updatePanel();
 	}
 
@@ -854,7 +862,9 @@
 
 	// Raumcode über URL: ...?mpjoin=ABCDE
 	function onGameReady() {
+		if (document.getElementById("multiplayerButton")) return;
 		buildPanel();
+		try { logMessage("Multiplayer-Mod geladen - Button oben rechts"); } catch (e) { }
 		try {
 			const join = new URLSearchParams(location.search).get("mpjoin");
 			if (join) setTimeout(() => { togglePanel(true); joinRoom(join); }, 500);
